@@ -11,7 +11,7 @@ on:
 jobs:
   compile:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180  # 延长超时，确保工具链编译完成
+    timeout-minutes: 180
 
     steps:
       - name: 检查rkp-ipid源码
@@ -35,72 +35,97 @@ jobs:
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
           [ -f "sdk.tar.zst" ] && [ $(stat -c%s "sdk.tar.zst") -gt 1024000 ] || { echo "SDK下载无效"; exit 1; }
 
-      - name: 解压SDK
+      - name: 解压SDK并查看平台目录结构（关键）
+        id: find_platform
         run: |
           rm -rf sdk
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          [ -d "sdk/target/qualcommax/ipq60xx" ] || { echo "SDK无ipq60xx平台配置"; exit 1; }
-          echo "SDK解压成功，平台目录：sdk/target/qualcommax/ipq60xx"
+          
+          # 查看target目录下的实际平台结构（动态识别，不硬编码）
+          echo "=== SDK target目录实际结构 ==="
+          ls -l sdk/target/
+          
+          # 步骤1：找BOARD目录（通常是平台大类，如qualcommax、ipq等）
+          BOARD_DIR=$(find sdk/target/ -maxdepth 1 -type d | grep -v "legacy" | grep -iE "qualcomm|ipq" | head -n1)
+          if [ -z "$BOARD_DIR" ]; then
+            echo "错误：未找到平台BOARD目录（如qualcommax/ipq）"
+            exit 1
+          fi
+          BOARD_NAME=$(basename "$BOARD_DIR")
+          echo "识别到BOARD目录：$BOARD_NAME"
+          
+          # 步骤2：找SUBTARGET目录（BOARD下的具体平台，如ipq60xx）
+          SUBTARGET_DIR=$(find "$BOARD_DIR" -maxdepth 1 -type d | grep -i "ipq60xx" | head -n1)
+          if [ -z "$SUBTARGET_DIR" ]; then
+            # 若未找到ipq60xx，打印BOARD下所有目录供排查
+            echo "错误：$BOARD_NAME下无ipq60xx目录，当前目录："
+            ls -l "$BOARD_DIR"
+            exit 1
+          fi
+          SUBTARGET_NAME=$(basename "$SUBTARGET_DIR")
+          echo "识别到SUBTARGET目录：$SUBTARGET_NAME"
+          
+          # 输出动态识别的参数
+          echo "board_name=$BOARD_NAME" >> $GITHUB_OUTPUT
+          echo "subtarget_name=$SUBTARGET_NAME" >> $GITHUB_OUTPUT
 
-      - name: 配置编译环境（指定qualcommax/ipq60xx平台）
+      - name: 配置编译环境（动态适配平台）
         run: |
           # 复制rkp-ipid到SDK
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 关键：完整指定目标平台（解决产物目录错误的核心）
-          echo "CONFIG_TARGET_BOARD=qualcommax" >> .config
-          echo "CONFIG_TARGET_SUBTARGET=ipq60xx" >> .config
-          echo "CONFIG_TARGET_PROFILE=DEVICE_generic" >> .config
-          echo "CONFIG_TARGET_ARCH=aarch64" >> .config
+          # 使用动态识别的BOARD和SUBTARGET（核心修复）
+          echo "CONFIG_TARGET_BOARD=${{ steps.find_platform.outputs.board_name }}" >> .config
+          echo "CONFIG_TARGET_SUBTARGET=${{ steps.find_platform.outputs.subtarget_name }}" >> .config
+          echo "CONFIG_TARGET_PROFILE=DEVICE_generic" >> .config  # 通用配置，适配所有设备
+          echo "CONFIG_TARGET_ARCH=aarch64" >> .config  # 匹配你的设备架构
           echo "CONFIG_TARGET_ARCH_PACKAGES=aarch64_cortex-a53" >> .config
           # 启用模块+锁定内核版本
           echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
           echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
           
-          # 生成最终配置（基于指定的平台参数）
+          # 生成最终配置
           make defconfig
           
-          # 打印配置确认（关键参数是否生效）
-          echo "=== 目标平台配置确认 ==="
+          # 确认配置生效
+          echo "=== 最终平台配置 ==="
           cat .config | grep -E "TARGET_BOARD|TARGET_SUBTARGET|TARGET_ARCH|KERNEL_PATCHVER"
 
-      - name: 初始化编译环境（生成工具链和依赖）
+      - name: 初始化工具链（生成产物目录）
         run: |
           cd sdk
-          # 先编译工具链和基础依赖（否则产物目录不生成）
+          # 编译工具链和基础依赖，创建bin/targets目录
           make tools/install toolchain/install -j4 V=sc
 
-      - name: 编译rkp-ipid模块（生成产物到targets目录）
+      - name: 编译rkp-ipid模块
         id: compile
         run: |
           cd sdk
-          # 编译模块并安装到产物目录
+          # 编译并安装到产物目录
           make package/rkp-ipid/install -j4 V=sc
           
-          # 关键：搜索ImmortalWrt标准产物目录（qualcommax/ipq60xx/packages）
-          IPK_FILE=$(find bin/targets/qualcommax/ipq60xx/packages/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
+          # 搜索动态平台目录下的产物
+          IPK_FILE=$(find bin/targets/${{ steps.find_platform.outputs.board_name }}/${{ steps.find_platform.outputs.subtarget_name }}/packages/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
           
-          # 打印bin目录完整结构（方便排查路径）
-          echo "=== bin目录结构 ==="
-          ls -l bin/
-          ls -l bin/targets/qualcommax/ipq60xx/
+          # 打印产物目录结构（方便排查）
+          echo "=== 产物目录结构 ==="
+          ls -l bin/targets/${{ steps.find_platform.outputs.board_name }}/${{ steps.find_platform.outputs.subtarget_name }}/
           
           if [ -z "$IPK_FILE" ]; then
             echo "错误：未找到ipk产物"
             exit 1
           fi
-          echo "找到产物：$IPK_FILE"
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传编译产物
+      - name: 上传产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}-ipq60xx
+          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
@@ -111,5 +136,5 @@ jobs:
           name: compile-logs-${{ github.run_id }}
           path: |
             sdk/logs/
-            sdk/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx/rkp-ipid-*/
+            sdk/build_dir/
           retention-days: 7
