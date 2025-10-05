@@ -1,4 +1,4 @@
-name: 编译rkp-ipid模块 (适配JDCloud RE-SS-01/aarch64)
+name: 编译rkp-ipid模块 (JDCloud RE-SS-01/aarch64)
 
 on:
   workflow_dispatch:
@@ -12,6 +12,10 @@ jobs:
   compile:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
+    env:
+      # 直接使用系统安装的aarch64交叉编译器（核心）
+      CROSS_COMPILE: aarch64-linux-gnu-
+      ARCH: aarch64
 
     steps:
       - name: 检查rkp-ipid源码
@@ -20,100 +24,95 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装aarch64交叉编译依赖
+      - name: 安装系统级aarch64交叉编译器（关键）
         run: |
           sudo apt update -y && sudo apt upgrade -y
+          # 安装完整的aarch64交叉编译工具链（不依赖SDK工具链）
           sudo apt install -y \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            zstd linux-headers-$(uname -r)  # 安装主机内核头文件备用
+            zstd linux-headers-${{ env.ARCH }}  # 安装aarch64内核头文件
+          # 验证编译器是否可用
+          if ! command -v ${{ env.CROSS_COMPILE }}gcc &> /dev/null; then
+            echo "错误：aarch64交叉编译器安装失败"
+            exit 1
+          fi
+          echo "交叉编译器就绪：${{ env.CROSS_COMPILE }}gcc"
 
-      - name: 下载并解压通用SDK
+      - name: 下载并解压通用SDK（仅用其内核头文件和Makefile）
         run: |
-          # 使用你的通用SDK链接
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
           [ -f "sdk.tar.zst" ] && [ $(stat -c%s "sdk.tar.zst") -gt 1024000 ] || { echo "SDK无效"; exit 1; }
           
-          # 解压SDK
           rm -rf sdk
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          echo "通用SDK解压完成，路径：sdk/"
+          echo "SDK解压完成，仅使用其内核配置文件"
 
-      - name: 手动配置aarch64编译参数（绕开平台目录）
+      - name: 简化配置（仅保留rkp-ipid编译必需参数）
         run: |
-          # 复制rkp-ipid源码到SDK
+          # 复制rkp-ipid到SDK包目录
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 1. 强制指定aarch64架构和内核版本（核心）
-          echo "CONFIG_ARCH=aarch64" >> .config
-          echo "CONFIG_CROSS_COMPILE=aarch64-linux-gnu-" >> .config  # 交叉编译器前缀
-          echo "CONFIG_KERNEL_VERSION=${{ github.event.inputs.kernelVersion }}" >> .config
-          echo "CONFIG_KERNEL_DIR=$(pwd)/build_dir/target-aarch64_cortex-a53_musl/linux-*/" >> .config
+          # 仅配置编译rkp-ipid必需的参数（忽略其他依赖）
+          cat > .config << EOF
+          CONFIG_ARCH=${{ env.ARCH }}
+          CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
+          CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}
+          CONFIG_PACKAGE_kmod-rkp-ipid=y
+          CONFIG_MODULES=y
+          CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
+          EOF
           
-          # 2. 启用rkp-ipid模块编译
-          echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
-          echo "CONFIG_MODULES=y" >> .config  # 启用内核模块支持
-          
-          # 3. 生成基础配置
-          make defconfig
-          
-          # 验证关键参数
-          echo "=== 强制编译参数确认 ==="
-          cat .config | grep -E "ARCH|CROSS_COMPILE|KERNEL_VERSION|MODULES"
+          # 生成基础配置（忽略无关依赖警告）
+          make defconfig IGNORE_ERRORS=1  # IGNORE_ERRORS忽略固件依赖警告
 
-      - name: 编译aarch64工具链（通用SDK必需）
-        run: |
-          cd sdk
-          # 编译aarch64交叉工具链（通用SDK无预编译工具链）
-          make toolchain/install ARCH=aarch64 CROSS_COMPILE=aarch64-linux-gnu- -j4 V=sc
-
-      - name: 编译rkp-ipid模块（强制aarch64架构）
+      - name: 编译rkp-ipid模块（直接用系统交叉编译器）
         id: compile
         run: |
           cd sdk
-          # 直接指定架构和交叉编译器编译模块
+          # 关键：直接编译模块，不依赖SDK工具链，忽略无关错误
           make package/rkp-ipid/compile \
-            ARCH=aarch64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
+            ARCH=${{ env.ARCH }} \
+            CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
             KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }} \
+            IGNORE_ERRORS=1 \  # 忽略固件依赖警告
             -j4 V=sc
           
-          # 搜索所有可能的产物路径（通用SDK产物目录不固定）
+          # 搜索所有aarch64架构的ipk产物（通用SDK路径不固定）
           echo "=== 搜索ipk产物 ==="
-          IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "aarch64|arm64" | head -n1)
+          IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "${{ env.ARCH }}|arm64" | head -n1)
           
-          # 打印所有找到的ipk文件（方便排查）
           if [ -z "$IPK_FILE" ]; then
-            echo "未找到ipk产物，当前目录下所有ipk："
-            find . -name "*.ipk" | grep -E "aarch64|arm64"
+            echo "未找到产物，打印所有ipk文件："
+            find . -name "*.ipk" | grep -E "${{ env.ARCH }}|arm64"
             exit 1
           fi
           
-          echo "找到aarch64架构产物：$IPK_FILE"
+          echo "找到aarch64产物：$IPK_FILE"
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
       - name: 上传最终产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-aarch64-${{ github.event.inputs.kernelVersion }}
+          name: kmod-rkp-ipid-${{ env.ARCH }}-${{ github.event.inputs.kernelVersion }}
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
-      - name: 上传编译日志（失败时）
+      - name: 上传错误日志
         if: steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: compile-logs-final
           path: |
             sdk/logs/
-            sdk/build_dir/
+            sdk/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/rkp-ipid-*/
             sdk/.config
           retention-days: 7
