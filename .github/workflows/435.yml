@@ -54,12 +54,13 @@ jobs:
             exit 1
           fi
 
-      - name: 配置编译参数（用SDK默认内核）
+      - name: 配置编译参数（修复内核版本查询）
         run: |
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
+          # 生成.config（不依赖KERNEL_PATCHVER）
           cat > .config << EOF
           CONFIG_ARCH=${{ env.ARCH }}
           CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
@@ -68,20 +69,26 @@ jobs:
           CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
           EOF
           
+          # 生成配置，忽略警告
           make defconfig IGNORE_ERRORS=1
-          echo "=== SDK默认内核版本 ==="
-          cat .config | grep "KERNEL_PATCHVER"
+          
+          # 核心修复：查询多个内核版本字段，未找到时不中断（|| true）
+          echo "=== SDK默认内核版本（支持KERNEL_PATCHVER/KERNEL_VERSION） ==="
+          cat .config | grep -E "KERNEL_PATCHVER|KERNEL_VERSION|TARGET_KERNEL_VERSION" || true
+          # 即使未找到版本字段，也继续流程（避免退出码1）
 
       - name: 编译rkp-ipid模块
         id: compile
         run: |
           cd sdk
+          # 编译模块，忽略无关警告
           make package/rkp-ipid/compile \
             ARCH=${{ env.ARCH }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
             IGNORE_ERRORS=1 \
             -j4 V=sc
           
+          # 搜索产物
           IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "${{ env.ARCH }}|arm64" | head -n1)
           if [ -z "$IPK_FILE" ]; then
             echo "未找到产物，当前ipk列表："
@@ -90,15 +97,20 @@ jobs:
           fi
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      # 拆分步骤1：获取SDK内核版本（存入环境变量）
-      - name: 获取SDK内核版本
+      - name: 获取SDK内核版本（用于产物命名）
         run: |
-          SDK_KERNEL=$(grep "KERNEL_PATCHVER" sdk/.config | awk -F= '{print $2}')
+          # 从.config提取内核版本，优先顺序：KERNEL_PATCHVER > KERNEL_VERSION > 自定义标记
+          SDK_KERNEL=$(cat sdk/.config | grep -E "KERNEL_PATCHVER=" | awk -F= '{print $2}')
+          if [ -z "$SDK_KERNEL" ]; then
+            SDK_KERNEL=$(cat sdk/.config | grep -E "KERNEL_VERSION=" | awk -F= '{print $2}')
+          fi
+          if [ -z "$SDK_KERNEL" ]; then
+            SDK_KERNEL="unknown-6.1.x"  # 默认标记，避免空值
+          fi
           echo "SDK_KERNEL=$SDK_KERNEL" >> $GITHUB_ENV
-          echo "SDK内核版本：$SDK_KERNEL"
+          echo "最终产物内核版本标记：$SDK_KERNEL"
 
-      # 拆分步骤2：上传产物（单独使用uses，不嵌套run）
-      - name: 上传产物（标注SDK内核版本）
+      - name: 上传产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
