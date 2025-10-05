@@ -2,11 +2,12 @@ name: 编译rkp-ipid模块 (JDCloud RE-SS-01/aarch64)
 
 on:
   workflow_dispatch:
+    # 移除内核版本输入，改用SDK默认内核
     inputs:
-      kernelVersion:
-        description: '设备内核版本'
-        required: true
-        default: '6.1.34'
+      unused:
+        description: '无需输入，直接触发'
+        required: false
+        default: '触发编译'
 
 jobs:
   compile:
@@ -23,9 +24,8 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装依赖（删除错误的aarch64头文件）
+      - name: 安装依赖
         run: |
-          # 关键：删除 linux-headers-aarch64（Ubuntu无此包），用SDK内置头文件
           sudo apt-get update --quiet=2
           sudo apt-get upgrade --yes --quiet=2
           sudo apt-get install --yes --quiet=2 \
@@ -33,16 +33,14 @@ jobs:
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
             gcc-aarch64-linux-gnu=4:11.2.0-1ubuntu1 g++-aarch64-linux-gnu=4:11.2.0-1ubuntu1 \
-            zstd  # 仅保留必需依赖，移除无效的头文件包
+            zstd
           
-          # 验证交叉编译器
           if ! command -v ${{ env.CROSS_COMPILE }}gcc &> /dev/null; then
             echo "错误：aarch64交叉编译器安装失败"
             exit 1
           fi
-          echo "交叉编译器就绪：$(${{ env.CROSS_COMPILE }}gcc --version | head -n1)"
 
-      - name: 下载并解压SDK（用其内置内核头文件）
+      - name: 下载并解压SDK
         run: |
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
@@ -52,41 +50,43 @@ jobs:
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          # 确认SDK内置内核头文件目录存在
-          if [ ! -d "sdk/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/" ]; then
-            echo "SDK无内置内核头文件目录，解压失败"
+          # 确认SDK有默认内核目录（避免内核文件缺失）
+          if [ -z "$(find sdk/target/linux/ -name "kernel-*" | head -n1)" ]; then
+            echo "SDK无默认内核目录，解压失败"
             exit 1
           fi
 
-      - name: 配置编译参数（用SDK内核头文件）
+      - name: 配置编译参数（用SDK默认内核）
         run: |
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 手动配置，指定SDK内置的内核头文件目录（核心修复）
+          # 关键：删除手动指定的KERNEL_PATCHVER，用SDK默认内核
           cat > .config << EOF
           CONFIG_ARCH=${{ env.ARCH }}
           CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
-          CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}
           CONFIG_PACKAGE_kmod-rkp-ipid=y
           CONFIG_MODULES=y
-          # 指向SDK中的内核头文件目录，无需系统头文件
+          # 让SDK自动识别内核目录，不手动指定
           CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
           EOF
           
-          # 生成配置，忽略无关依赖警告
+          # 生成配置，自动匹配SDK默认内核版本
           make defconfig IGNORE_ERRORS=1
+          
+          # 打印SDK默认内核版本（确认是否与设备兼容）
+          echo "=== SDK默认内核版本 ==="
+          cat .config | grep "KERNEL_PATCHVER"
 
-      - name: 编译rkp-ipid模块
+      - name: 编译rkp-ipid模块（用SDK默认内核）
         id: compile
         run: |
           cd sdk
-          # 用SDK内核头文件+系统交叉编译器编译
+          # 不手动指定内核版本，避免冲突
           make package/rkp-ipid/compile \
             ARCH=${{ env.ARCH }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
-            KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }} \
             IGNORE_ERRORS=1 \
             -j4 V=sc
           
@@ -99,11 +99,15 @@ jobs:
           fi
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传产物
+      - name: 上传产物（标注SDK内核版本）
         if: steps.compile.outcome == 'success'
+        run: |
+          # 获取SDK实际内核版本，用于产物命名
+          SDK_KERNEL=$(grep "KERNEL_PATCHVER" sdk/.config | awk -F= '{print $2}')
+          echo "产物基于SDK内核版本：$SDK_KERNEL"
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ env.ARCH }}-${{ github.event.inputs.kernelVersion }}
+          name: kmod-rkp-ipid-${{ env.ARCH }}-sdk-kernel-${{ env.SDK_KERNEL }}
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
