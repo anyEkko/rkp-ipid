@@ -23,27 +23,26 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装依赖（用apt-get消除脚本警告）
+      - name: 安装依赖（删除错误的aarch64头文件）
         run: |
-          # 替换apt为apt-get（CLI更稳定，适合脚本），添加--yes自动确认
-          sudo apt-get update --quiet=2  # --quiet减少输出
+          # 关键：删除 linux-headers-aarch64（Ubuntu无此包），用SDK内置头文件
+          sudo apt-get update --quiet=2
           sudo apt-get upgrade --yes --quiet=2
-          # 安装所有必需依赖，明确指定版本避免歧义
           sudo apt-get install --yes --quiet=2 \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
             gcc-aarch64-linux-gnu=4:11.2.0-1ubuntu1 g++-aarch64-linux-gnu=4:11.2.0-1ubuntu1 \
-            zstd linux-headers-${{ env.ARCH }}=5.4.0-153-generic
+            zstd  # 仅保留必需依赖，移除无效的头文件包
           
-          # 验证交叉编译器（确保安装成功）
+          # 验证交叉编译器
           if ! command -v ${{ env.CROSS_COMPILE }}gcc &> /dev/null; then
-            echo "错误：aarch64交叉编译器未安装成功"
+            echo "错误：aarch64交叉编译器安装失败"
             exit 1
           fi
-          echo "交叉编译器版本：$(${{ env.CROSS_COMPILE }}gcc --version | head -n1)"
+          echo "交叉编译器就绪：$(${{ env.CROSS_COMPILE }}gcc --version | head -n1)"
 
-      - name: 下载并解压通用SDK
+      - name: 下载并解压SDK（用其内置内核头文件）
         run: |
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
@@ -53,20 +52,26 @@ jobs:
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
+          # 确认SDK内置内核头文件目录存在
+          if [ ! -d "sdk/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/" ]; then
+            echo "SDK无内置内核头文件目录，解压失败"
+            exit 1
+          fi
 
-      - name: 配置编译参数（极简）
+      - name: 配置编译参数（用SDK内核头文件）
         run: |
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 手动生成极简.config，仅保留必需参数
+          # 手动配置，指定SDK内置的内核头文件目录（核心修复）
           cat > .config << EOF
           CONFIG_ARCH=${{ env.ARCH }}
           CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
           CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}
           CONFIG_PACKAGE_kmod-rkp-ipid=y
           CONFIG_MODULES=y
+          # 指向SDK中的内核头文件目录，无需系统头文件
           CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
           EOF
           
@@ -77,7 +82,7 @@ jobs:
         id: compile
         run: |
           cd sdk
-          # 用系统交叉编译器编译，忽略无关错误
+          # 用SDK内核头文件+系统交叉编译器编译
           make package/rkp-ipid/compile \
             ARCH=${{ env.ARCH }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
@@ -88,7 +93,7 @@ jobs:
           # 搜索产物
           IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "${{ env.ARCH }}|arm64" | head -n1)
           if [ -z "$IPK_FILE" ]; then
-            echo "未找到产物，当前目录ipk："
+            echo "未找到产物，当前ipk列表："
             find . -name "*.ipk" | grep -E "${{ env.ARCH }}|arm64"
             exit 1
           fi
