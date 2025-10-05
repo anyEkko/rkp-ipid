@@ -1,51 +1,111 @@
-name: Compile rkp-ipid for JDCloud RE-SS-01 (ipq60xx)
+name: 编译rkp-ipid模块 (适配JDCloud RE-SS-01)
 
 on:
-  workflow_dispatch:  # 手动触发编译
+  workflow_dispatch:
+    inputs:
+      kernelVersion:
+        description: '内核版本'
+        required: true
+        default: '6.1.34'
+      sdkUrl:
+        description: 'ImmortalWrt SDK下载链接'
+        required: true
+        default: 'https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz'
 
 jobs:
   compile:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120  # 延长超时时间
+
     steps:
-      - name: Checkout rkp-ipid code
+      - name: 检查代码
         uses: actions/checkout@v4
         with:
           path: rkp-ipid
+          fetch-depth: 1
 
-      - name: Install build dependencies
+      - name: 安装编译依赖
         run: |
-          sudo apt update && sudo apt install -y \
+          sudo apt update -y
+          sudo apt install -y \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
-            unzip python3 python3-distutils file
+            unzip python3 python3-distutils file flex bison \
+            gcc-aarch64-linux-gnu ninja-build cmake
+          # 清理缓存减少磁盘占用
+          sudo apt autoremove -y && sudo apt clean
 
-      - name: Download ImmortalWrt Snapshot SDK (qualcommax/ipq60xx)
+      - name: 下载并解压SDK
         run: |
-          SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz"
-          wget -q --no-check-certificate $SDK_URL -O sdk.tar.xz
-          tar xf sdk.tar.xz
-          mv immortalwrt-sdk-* sdk
+          # 创建SDK目录
+          mkdir -p sdk
+          # 下载SDK（带进度条和重试）
+          wget --no-check-certificate -c --progress=bar:force ${{ github.event.inputs.sdkUrl }} -O sdk.tar.xz
+          # 验证压缩包完整性
+          if ! tar xf sdk.tar.xz -C sdk --strip-components=1; then
+            echo "SDK压缩包损坏，尝试备用链接"
+            # 备用SDK链接（防止主链接失效）
+            wget --no-check-certificate -c https://archive.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz -O sdk.tar.xz
+            tar xf sdk.tar.xz -C sdk --strip-components=1
+          fi
 
-      - name: Prepare rkp-ipid package
+      - name: 准备编译环境
         run: |
-          cp -r rkp-ipid sdk/package/
-
-      - name: Configure build options
-        run: |
+          # 复制源码到SDK包目录
+          mkdir -p sdk/package/rkp-ipid
+          cp -r rkp-ipid/* sdk/package/rkp-ipid/
+          
+          # 进入SDK目录
           cd sdk
+          
+          # 更新feeds
+          ./scripts/feeds update -a > /dev/null
+          ./scripts/feeds install -a > /dev/null
+          
+          # 加载目标平台配置
           cp configs/immortalwrt_qualcommax_ipq60xx_defconfig .config
+          
+          # 启用rkp-ipid模块
           echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
-          echo "CONFIG_KERNEL_VERSION=6.1.34" >> .config
+          
+          # 锁定内核版本
+          echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
+          
+          # 生成配置
           make defconfig
 
-      - name: Compile the module
+      - name: 编译模块
+        id: compile
         run: |
           cd sdk
-          make package/rkp-ipid/compile V=sc -j$(nproc)
+          # 显示编译配置（用于调试）
+          cat .config | grep -E "KERNEL_PATCHVER|rkp-ipid"
+          
+          # 开始编译（限制线程数防止OOM）
+          make package/rkp-ipid/compile V=sc -j$(nproc --all)
+          
+          # 查找编译产物
+          IPK_FILE=$(find bin/packages/aarch64_cortex-a53/base/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
+          if [ -z "$IPK_FILE" ]; then
+            echo "编译产物未找到"
+            exit 1
+          fi
+          echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: Upload compiled package
-        uses: actions/upload-artifact@v4  # 已升级为 v4 版本
+      - name: 上传编译产物
+        if: steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@v4
         with:
-          name: rkp-ipid-jdcloud-re-ss-01
-          path: sdk/bin/packages/aarch64_cortex-a53/base/kmod-rkp-ipid_*.ipk
-          retention-days: 7  # 可选：设置 artifact 保留天数（默认 90 天）
+          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}
+          path: ${{ steps.compile.outputs.ipk_path }}
+          retention-days: 30
+
+      - name: 上传编译日志（失败时）
+        if: steps.compile.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-logs
+          path: |
+            sdk/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx/rkp-ipid-*/.compile.log
+            sdk/logs/
+          retention-days: 7
