@@ -11,7 +11,7 @@ on:
 jobs:
   compile:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 180  # 延长超时，确保工具链编译完成
 
     steps:
       - name: 检查rkp-ipid源码
@@ -35,62 +35,65 @@ jobs:
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
           [ -f "sdk.tar.zst" ] && [ $(stat -c%s "sdk.tar.zst") -gt 1024000 ] || { echo "SDK下载无效"; exit 1; }
 
-      - name: 解压SDK（不依赖configs目录）
+      - name: 解压SDK
         run: |
           rm -rf sdk
-          # 完整解压SDK（保留所有目录）
           tar --use-compress-program=zstd -xf sdk.tar.zst
-          # 提取顶层目录并命名为sdk
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          # 验证关键目录（target和package必须存在）
-          if [ ! -d "sdk/target" ] || [ ! -d "sdk/package" ]; then
-            echo "SDK解压失败：缺少target或package目录"
-            exit 1
-          fi
-          echo "SDK解压成功，使用target目录配置"
+          [ -d "sdk/target/qualcommax/ipq60xx" ] || { echo "SDK无ipq60xx平台配置"; exit 1; }
+          echo "SDK解压成功，平台目录：sdk/target/qualcommax/ipq60xx"
 
-      - name: 配置编译环境（绕开configs目录）
+      - name: 配置编译环境（指定qualcommax/ipq60xx平台）
         run: |
-          # 复制rkp-ipid到SDK的package目录
+          # 复制rkp-ipid到SDK
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 1. 生成默认配置（自动读取target目录下的平台配置）
-          make defconfig
-          
-          # 2. 手动启用rkp-ipid模块编译
-          echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
-          # 3. 锁定内核版本（与设备一致）
-          echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
-          # 4. 强制指定架构为aarch64_cortex-a53（匹配你的设备）
+          # 关键：完整指定目标平台（解决产物目录错误的核心）
+          echo "CONFIG_TARGET_BOARD=qualcommax" >> .config
+          echo "CONFIG_TARGET_SUBTARGET=ipq60xx" >> .config
+          echo "CONFIG_TARGET_PROFILE=DEVICE_generic" >> .config
           echo "CONFIG_TARGET_ARCH=aarch64" >> .config
           echo "CONFIG_TARGET_ARCH_PACKAGES=aarch64_cortex-a53" >> .config
+          # 启用模块+锁定内核版本
+          echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
+          echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
           
-          # 5. 刷新配置（确保所有选项生效）
+          # 生成最终配置（基于指定的平台参数）
           make defconfig
+          
+          # 打印配置确认（关键参数是否生效）
+          echo "=== 目标平台配置确认 ==="
+          cat .config | grep -E "TARGET_BOARD|TARGET_SUBTARGET|TARGET_ARCH|KERNEL_PATCHVER"
 
-      - name: 编译rkp-ipid模块
+      - name: 初始化编译环境（生成工具链和依赖）
+        run: |
+          cd sdk
+          # 先编译工具链和基础依赖（否则产物目录不生成）
+          make tools/install toolchain/install -j4 V=sc
+
+      - name: 编译rkp-ipid模块（生成产物到targets目录）
         id: compile
         run: |
           cd sdk
-          # 查看最终配置（确认架构和模块已启用）
-          echo "=== 最终编译配置确认 ==="
-          cat .config | grep -E "TARGET_ARCH|rkp-ipid|KERNEL_PATCHVER"
+          # 编译模块并安装到产物目录
+          make package/rkp-ipid/install -j4 V=sc
           
-          # 限制4线程编译，避免内存溢出
-          make package/rkp-ipid/compile V=sc -j4
+          # 关键：搜索ImmortalWrt标准产物目录（qualcommax/ipq60xx/packages）
+          IPK_FILE=$(find bin/targets/qualcommax/ipq60xx/packages/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
           
-          # 查找aarch64架构的ipk产物（可能在base或packages目录）
-          IPK_FILE=$(find bin/packages/aarch64_cortex-a53/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
+          # 打印bin目录完整结构（方便排查路径）
+          echo "=== bin目录结构 ==="
+          ls -l bin/
+          ls -l bin/targets/qualcommax/ipq60xx/
+          
           if [ -z "$IPK_FILE" ]; then
             echo "错误：未找到ipk产物"
-            # 打印bin目录结构，方便排查
-            echo "bin目录内容："
-            ls -l bin/packages/
             exit 1
           fi
+          echo "找到产物：$IPK_FILE"
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
       - name: 上传编译产物
