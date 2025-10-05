@@ -2,7 +2,6 @@ name: 编译rkp-ipid模块 (JDCloud RE-SS-01/aarch64)
 
 on:
   workflow_dispatch:
-    # 移除内核版本输入，改用SDK默认内核
     inputs:
       unused:
         description: '无需输入，直接触发'
@@ -50,7 +49,6 @@ jobs:
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          # 确认SDK有默认内核目录（避免内核文件缺失）
           if [ -z "$(find sdk/target/linux/ -name "kernel-*" | head -n1)" ]; then
             echo "SDK无默认内核目录，解压失败"
             exit 1
@@ -62,35 +60,28 @@ jobs:
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 关键：删除手动指定的KERNEL_PATCHVER，用SDK默认内核
           cat > .config << EOF
           CONFIG_ARCH=${{ env.ARCH }}
           CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
           CONFIG_PACKAGE_kmod-rkp-ipid=y
           CONFIG_MODULES=y
-          # 让SDK自动识别内核目录，不手动指定
           CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
           EOF
           
-          # 生成配置，自动匹配SDK默认内核版本
           make defconfig IGNORE_ERRORS=1
-          
-          # 打印SDK默认内核版本（确认是否与设备兼容）
           echo "=== SDK默认内核版本 ==="
           cat .config | grep "KERNEL_PATCHVER"
 
-      - name: 编译rkp-ipid模块（用SDK默认内核）
+      - name: 编译rkp-ipid模块
         id: compile
         run: |
           cd sdk
-          # 不手动指定内核版本，避免冲突
           make package/rkp-ipid/compile \
             ARCH=${{ env.ARCH }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
             IGNORE_ERRORS=1 \
             -j4 V=sc
           
-          # 搜索产物
           IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "${{ env.ARCH }}|arm64" | head -n1)
           if [ -z "$IPK_FILE" ]; then
             echo "未找到产物，当前ipk列表："
@@ -99,12 +90,16 @@ jobs:
           fi
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
+      # 拆分步骤1：获取SDK内核版本（存入环境变量）
+      - name: 获取SDK内核版本
+        run: |
+          SDK_KERNEL=$(grep "KERNEL_PATCHVER" sdk/.config | awk -F= '{print $2}')
+          echo "SDK_KERNEL=$SDK_KERNEL" >> $GITHUB_ENV
+          echo "SDK内核版本：$SDK_KERNEL"
+
+      # 拆分步骤2：上传产物（单独使用uses，不嵌套run）
       - name: 上传产物（标注SDK内核版本）
         if: steps.compile.outcome == 'success'
-        run: |
-          # 获取SDK实际内核版本，用于产物命名
-          SDK_KERNEL=$(grep "KERNEL_PATCHVER" sdk/.config | awk -F= '{print $2}')
-          echo "产物基于SDK内核版本：$SDK_KERNEL"
         uses: actions/upload-artifact@v4
         with:
           name: kmod-rkp-ipid-${{ env.ARCH }}-sdk-kernel-${{ env.SDK_KERNEL }}
