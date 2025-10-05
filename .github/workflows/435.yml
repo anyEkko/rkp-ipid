@@ -1,4 +1,4 @@
-name: 编译rkp-ipid模块 (适配JDCloud RE-SS-01)
+name: 编译rkp-ipid模块 (适配JDCloud RE-SS-01/aarch64)
 
 on:
   workflow_dispatch:
@@ -20,121 +20,100 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装依赖
+      - name: 安装aarch64交叉编译依赖
         run: |
           sudo apt update -y && sudo apt upgrade -y
           sudo apt install -y \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
-            gcc-aarch64-linux-gnu ninja-build cmake zstd
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            zstd linux-headers-$(uname -r)  # 安装主机内核头文件备用
 
-      - name: 下载SDK
+      - name: 下载并解压通用SDK
         run: |
+          # 使用你的通用SDK链接
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
-          [ -f "sdk.tar.zst" ] && [ $(stat -c%s "sdk.tar.zst") -gt 1024000 ] || { echo "SDK下载无效"; exit 1; }
-
-      - name: 解压SDK并查看平台目录结构（关键）
-        id: find_platform
-        run: |
+          [ -f "sdk.tar.zst" ] && [ $(stat -c%s "sdk.tar.zst") -gt 1024000 ] || { echo "SDK无效"; exit 1; }
+          
+          # 解压SDK
           rm -rf sdk
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          
-          # 查看target目录下的实际平台结构（动态识别，不硬编码）
-          echo "=== SDK target目录实际结构 ==="
-          ls -l sdk/target/
-          
-          # 步骤1：找BOARD目录（通常是平台大类，如qualcommax、ipq等）
-          BOARD_DIR=$(find sdk/target/ -maxdepth 1 -type d | grep -v "legacy" | grep -iE "qualcomm|ipq" | head -n1)
-          if [ -z "$BOARD_DIR" ]; then
-            echo "错误：未找到平台BOARD目录（如qualcommax/ipq）"
-            exit 1
-          fi
-          BOARD_NAME=$(basename "$BOARD_DIR")
-          echo "识别到BOARD目录：$BOARD_NAME"
-          
-          # 步骤2：找SUBTARGET目录（BOARD下的具体平台，如ipq60xx）
-          SUBTARGET_DIR=$(find "$BOARD_DIR" -maxdepth 1 -type d | grep -i "ipq60xx" | head -n1)
-          if [ -z "$SUBTARGET_DIR" ]; then
-            # 若未找到ipq60xx，打印BOARD下所有目录供排查
-            echo "错误：$BOARD_NAME下无ipq60xx目录，当前目录："
-            ls -l "$BOARD_DIR"
-            exit 1
-          fi
-          SUBTARGET_NAME=$(basename "$SUBTARGET_DIR")
-          echo "识别到SUBTARGET目录：$SUBTARGET_NAME"
-          
-          # 输出动态识别的参数
-          echo "board_name=$BOARD_NAME" >> $GITHUB_OUTPUT
-          echo "subtarget_name=$SUBTARGET_NAME" >> $GITHUB_OUTPUT
+          echo "通用SDK解压完成，路径：sdk/"
 
-      - name: 配置编译环境（动态适配平台）
+      - name: 手动配置aarch64编译参数（绕开平台目录）
         run: |
-          # 复制rkp-ipid到SDK
+          # 复制rkp-ipid源码到SDK
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 使用动态识别的BOARD和SUBTARGET（核心修复）
-          echo "CONFIG_TARGET_BOARD=${{ steps.find_platform.outputs.board_name }}" >> .config
-          echo "CONFIG_TARGET_SUBTARGET=${{ steps.find_platform.outputs.subtarget_name }}" >> .config
-          echo "CONFIG_TARGET_PROFILE=DEVICE_generic" >> .config  # 通用配置，适配所有设备
-          echo "CONFIG_TARGET_ARCH=aarch64" >> .config  # 匹配你的设备架构
-          echo "CONFIG_TARGET_ARCH_PACKAGES=aarch64_cortex-a53" >> .config
-          # 启用模块+锁定内核版本
-          echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
-          echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
+          # 1. 强制指定aarch64架构和内核版本（核心）
+          echo "CONFIG_ARCH=aarch64" >> .config
+          echo "CONFIG_CROSS_COMPILE=aarch64-linux-gnu-" >> .config  # 交叉编译器前缀
+          echo "CONFIG_KERNEL_VERSION=${{ github.event.inputs.kernelVersion }}" >> .config
+          echo "CONFIG_KERNEL_DIR=$(pwd)/build_dir/target-aarch64_cortex-a53_musl/linux-*/" >> .config
           
-          # 生成最终配置
+          # 2. 启用rkp-ipid模块编译
+          echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
+          echo "CONFIG_MODULES=y" >> .config  # 启用内核模块支持
+          
+          # 3. 生成基础配置
           make defconfig
           
-          # 确认配置生效
-          echo "=== 最终平台配置 ==="
-          cat .config | grep -E "TARGET_BOARD|TARGET_SUBTARGET|TARGET_ARCH|KERNEL_PATCHVER"
+          # 验证关键参数
+          echo "=== 强制编译参数确认 ==="
+          cat .config | grep -E "ARCH|CROSS_COMPILE|KERNEL_VERSION|MODULES"
 
-      - name: 初始化工具链（生成产物目录）
+      - name: 编译aarch64工具链（通用SDK必需）
         run: |
           cd sdk
-          # 编译工具链和基础依赖，创建bin/targets目录
-          make tools/install toolchain/install -j4 V=sc
+          # 编译aarch64交叉工具链（通用SDK无预编译工具链）
+          make toolchain/install ARCH=aarch64 CROSS_COMPILE=aarch64-linux-gnu- -j4 V=sc
 
-      - name: 编译rkp-ipid模块
+      - name: 编译rkp-ipid模块（强制aarch64架构）
         id: compile
         run: |
           cd sdk
-          # 编译并安装到产物目录
-          make package/rkp-ipid/install -j4 V=sc
+          # 直接指定架构和交叉编译器编译模块
+          make package/rkp-ipid/compile \
+            ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }} \
+            -j4 V=sc
           
-          # 搜索动态平台目录下的产物
-          IPK_FILE=$(find bin/targets/${{ steps.find_platform.outputs.board_name }}/${{ steps.find_platform.outputs.subtarget_name }}/packages/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
+          # 搜索所有可能的产物路径（通用SDK产物目录不固定）
+          echo "=== 搜索ipk产物 ==="
+          IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "aarch64|arm64" | head -n1)
           
-          # 打印产物目录结构（方便排查）
-          echo "=== 产物目录结构 ==="
-          ls -l bin/targets/${{ steps.find_platform.outputs.board_name }}/${{ steps.find_platform.outputs.subtarget_name }}/
-          
+          # 打印所有找到的ipk文件（方便排查）
           if [ -z "$IPK_FILE" ]; then
-            echo "错误：未找到ipk产物"
+            echo "未找到ipk产物，当前目录下所有ipk："
+            find . -name "*.ipk" | grep -E "aarch64|arm64"
             exit 1
           fi
+          
+          echo "找到aarch64架构产物：$IPK_FILE"
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传产物
+      - name: 上传最终产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}
+          name: kmod-rkp-ipid-aarch64-${{ github.event.inputs.kernelVersion }}
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
-      - name: 上传错误日志
+      - name: 上传编译日志（失败时）
         if: steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: compile-logs-${{ github.run_id }}
+          name: compile-logs-final
           path: |
             sdk/logs/
             sdk/build_dir/
+            sdk/.config
           retention-days: 7
