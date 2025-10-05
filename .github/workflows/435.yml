@@ -6,12 +6,12 @@ on:
       kernelVersion:
         description: '设备内核版本'
         required: true
-        default: '6.1.34'  # 你的设备内核版本
+        default: '6.1.34'
 
 jobs:
   compile:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120  # 足够的编译时间
+    timeout-minutes: 120
 
     steps:
       - name: 检查rkp-ipid源码
@@ -20,99 +20,83 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装编译依赖（含zstd解压工具）
+      - name: 安装依赖（含zstd）
         run: |
           sudo apt update -y && sudo apt upgrade -y
           sudo apt install -y \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
-            gcc-aarch64-linux-gnu ninja-build cmake zstd  # 新增zstd支持.tar.zst格式
+            gcc-aarch64-linux-gnu ninja-build cmake zstd
 
-      - name: 下载新SDK（固定有效链接）
+      - name: 下载新SDK（固定链接）
         run: |
-          # 使用你提供的新SDK链接（.tar.zst格式）
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
-          
-          # 下载SDK（带进度条，断点续传）
-          wget --no-check-certificate -c --progress=bar:force \
-            $SDK_URL -O sdk.tar.zst
-          
-          # 验证文件存在
-          if [ ! -f "sdk.tar.zst" ]; then
-            echo "SDK下载失败，文件不存在"
-            exit 1
-          fi
+          wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
+          [ -f "sdk.tar.zst" ] || { echo "SDK下载失败"; exit 1; }
 
-      - name: 解压.zst格式SDK
+      - name: 解压SDK
         run: |
-          # 创建SDK目录
           mkdir -p sdk
-          
-          # 使用zstd解压（适配.tar.zst格式）
           tar --use-compress-program=zstd -xf sdk.tar.zst -C sdk --strip-components=1
+          [ -d "sdk/configs" ] || { echo "SDK解压失败，无configs目录"; exit 1; }
+
+      - name: 查看SDK实际配置文件（关键修复）
+        id: find_config
+        run: |
+          cd sdk/configs
+          # 列出所有ipq60xx相关的配置文件，方便找到正确名称
+          echo "=== SDK中可用的ipq60xx配置文件 ==="
+          ls -l *.defconfig | grep -i ipq60xx
           
-          # 验证解压成功（检查关键目录）
-          if [ ! -d "sdk/package" ]; then
-            echo "SDK解压失败，关键目录缺失"
+          # 自动匹配含"ipq60xx"的配置文件（取第一个，适配命名变化）
+          CONFIG_FILE=$(ls *.defconfig | grep -i ipq60xx | head -n1)
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "错误：未找到ipq60xx相关配置文件"
             exit 1
           fi
+          
+          echo "找到正确配置文件：$CONFIG_FILE"
+          echo "config_file=$CONFIG_FILE" >> $GITHUB_OUTPUT
 
-      - name: 配置编译环境（适配ipq60xx）
+      - name: 配置编译环境（用实际配置文件）
         run: |
-          # 复制rkp-ipid到SDK的package目录
+          # 复制rkp-ipid源码
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 更新依赖源
-          ./scripts/feeds update -a > /dev/null
-          ./scripts/feeds install -a > /dev/null
+          # 用步骤5找到的实际配置文件（不再硬编码文件名）
+          cp configs/${{ steps.find_config.outputs.config_file }} .config
           
-          # 加载ipq60xx平台默认配置
-          cp configs/immortalwrt_qualcommax_ipq60xx_defconfig .config
-          
-          # 启用rkp-ipid编译+锁定内核版本
+          # 启用模块+锁定内核版本
           echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
           echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
           
-          # 生成最终编译配置
           make defconfig
 
-      - name: 编译rkp-ipid模块
+      - name: 编译模块
         id: compile
         run: |
           cd sdk
-          # 显示关键配置（调试用）
-          echo "=== 编译配置确认 ==="
-          cat .config | grep -E "KERNEL_PATCHVER|rkp-ipid|aarch64"
-          
-          # 限制4线程编译（避免GitHub内存溢出）
           make package/rkp-ipid/compile V=sc -j4
           
-          # 查找aarch64架构的ipk产物
           IPK_FILE=$(find bin/packages/aarch64_cortex-a53/base/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
-          if [ -z "$IPK_FILE" ]; then
-            echo "错误：未找到编译后的ipk文件"
-            exit 1
-          fi
-          
+          [ -n "$IPK_FILE" ] || { echo "无ipk产物"; exit 1; }
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传编译产物
+      - name: 上传产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}-ipq60xx
+          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
-      - name: 上传错误日志（编译失败时）
+      - name: 上传错误日志
         if: steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: compile-logs-${{ github.run_id }}
-          path: |
-            sdk/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx/rkp-ipid-*/.compile.log
-            sdk/logs/
+          path: sdk/logs/
           retention-days: 7
