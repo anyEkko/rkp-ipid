@@ -17,11 +17,17 @@ jobs:
       ARCH: aarch64
 
     steps:
-      - name: 检查rkp-ipid源码
+      - name: 检查rkp-ipid源码（确认代码存在）
         uses: actions/checkout@v4
         with:
           path: rkp-ipid
           fetch-depth: 1
+      - run: |
+          # 确认rkp-ipid核心文件存在（避免源码缺失）
+          echo "=== 确认rkp-ipid源码结构 ==="
+          ls -l rkp-ipid/
+          [ -f "rkp-ipid/src/rkp-ipid.c" ] || { echo "错误：缺失rkp-ipid.c源码"; exit 1; }
+          [ -f "rkp-ipid/Makefile" ] || { echo "错误：缺失Makefile"; exit 1; }
 
       - name: 安装依赖
         run: |
@@ -33,34 +39,27 @@ jobs:
             unzip python3 python3-distutils file flex bison \
             gcc-aarch64-linux-gnu=4:11.2.0-1ubuntu1 g++-aarch64-linux-gnu=4:11.2.0-1ubuntu1 \
             zstd
-          
-          if ! command -v ${{ env.CROSS_COMPILE }}gcc &> /dev/null; then
-            echo "错误：aarch64交叉编译器安装失败"
-            exit 1
-          fi
 
       - name: 下载并解压SDK
         run: |
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
           [ -f "sdk.tar.zst" ] && [ $(stat -c%s "sdk.tar.zst") -gt 1024000 ] || { echo "SDK无效"; exit 1; }
-          
           rm -rf sdk
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          if [ -z "$(find sdk/target/linux/ -name "kernel-*" | head -n1)" ]; then
-            echo "SDK无默认内核目录，解压失败"
-            exit 1
-          fi
 
-      - name: 配置编译参数（修复内核版本查询）
+      - name: 配置编译参数（显式暴露错误）
         run: |
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
-          
           cd sdk
-          # 生成.config（不依赖KERNEL_PATCHVER）
+          # 打印Makefile确认配置（关键：检查模块编译规则）
+          echo "=== 查看rkp-ipid Makefile关键内容 ==="
+          grep -E "PKG_NAME|FILES|MODULES|EXTRA_CFLAGS" package/rkp-ipid/Makefile
+          
+          # 生成.config（不忽略错误，显式暴露配置问题）
           cat > .config << EOF
           CONFIG_ARCH=${{ env.ARCH }}
           CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
@@ -68,62 +67,58 @@ jobs:
           CONFIG_MODULES=y
           CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
           EOF
-          
-          # 生成配置，忽略警告
-          make defconfig IGNORE_ERRORS=1
-          
-          # 核心修复：查询多个内核版本字段，未找到时不中断（|| true）
-          echo "=== SDK默认内核版本（支持KERNEL_PATCHVER/KERNEL_VERSION） ==="
-          cat .config | grep -E "KERNEL_PATCHVER|KERNEL_VERSION|TARGET_KERNEL_VERSION" || true
-          # 即使未找到版本字段，也继续流程（避免退出码1）
+          make defconfig  # 移除IGNORE_ERRORS，显式配置错误
 
-      - name: 编译rkp-ipid模块
+      - name: 编译并打包ipk（关键：用install目标，不忽略错误）
         id: compile
         run: |
           cd sdk
-          # 编译模块，忽略无关警告
-          make package/rkp-ipid/compile \
+          # 1. 编译+安装（install目标会生成ipk并放到bin目录）
+          # 移除IGNORE_ERRORS，显式暴露代码编译错误
+          make package/rkp-ipid/install \
             ARCH=${{ env.ARCH }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
-            IGNORE_ERRORS=1 \
-            -j4 V=sc
+            -j4 V=sc  # V=sc显示详细编译日志，方便定位错误
           
-          # 搜索产物
-          IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "${{ env.ARCH }}|arm64" | head -n1)
+          # 2. 查看编译目录结构（确认是否生成.ko和ipk）
+          echo "=== 查看rkp-ipid编译目录（是否有.ko文件） ==="
+          BUILD_DIR=$(find build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/ -name "rkp-ipid-*" | head -n1)
+          if [ -n "$BUILD_DIR" ]; then
+            ls -l "$BUILD_DIR"  # 查看是否生成rkp-ipid.ko
+            [ -f "$BUILD_DIR/rkp-ipid.ko" ] && echo "模块.ko文件生成成功" || echo "错误：未生成.ko文件"
+          else
+            echo "错误：未找到rkp-ipid编译目录"
+            exit 1
+          fi
+          
+          # 3. 搜索所有可能的ipk路径（扩大范围）
+          echo "=== 搜索所有ipk文件 ==="
+          find . -name "kmod-rkp-ipid_*.ipk"  # 搜索全目录
+          IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | head -n1)
+          
           if [ -z "$IPK_FILE" ]; then
-            echo "未找到产物，当前ipk列表："
-            find . -name "*.ipk" | grep -E "${{ env.ARCH }}|arm64"
+            echo "=== 未找到ipk，显示bin目录结构 ==="
+            ls -l bin/  # 查看bin目录是否有产物目录
+            ls -l bin/packages/ 2>/dev/null || ls -l bin/targets/ 2>/dev/null
             exit 1
           fi
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
-
-      - name: 获取SDK内核版本（用于产物命名）
-        run: |
-          # 从.config提取内核版本，优先顺序：KERNEL_PATCHVER > KERNEL_VERSION > 自定义标记
-          SDK_KERNEL=$(cat sdk/.config | grep -E "KERNEL_PATCHVER=" | awk -F= '{print $2}')
-          if [ -z "$SDK_KERNEL" ]; then
-            SDK_KERNEL=$(cat sdk/.config | grep -E "KERNEL_VERSION=" | awk -F= '{print $2}')
-          fi
-          if [ -z "$SDK_KERNEL" ]; then
-            SDK_KERNEL="unknown-6.1.x"  # 默认标记，避免空值
-          fi
-          echo "SDK_KERNEL=$SDK_KERNEL" >> $GITHUB_ENV
-          echo "最终产物内核版本标记：$SDK_KERNEL"
 
       - name: 上传产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ env.ARCH }}-sdk-kernel-${{ env.SDK_KERNEL }}
+          name: kmod-rkp-ipid-${{ env.ARCH }}
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
-      - name: 上传错误日志
+      - name: 上传详细编译日志（失败时）
         if: steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: compile-logs
+          name: compile-logs-detail
           path: |
             sdk/logs/
             sdk/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/rkp-ipid-*/
+            sdk/package/rkp-ipid/Makefile
           retention-days: 7
