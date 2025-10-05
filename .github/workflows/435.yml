@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       kernelVersion:
-        description: '内核版本'
+        description: '设备内核版本'
         required: true
         default: '6.1.34'
-      sdkUrl:
-        description: 'ImmortalWrt SDK下载链接'
+      sdkTargetDir:
+        description: 'ImmortalWrt SDK目标平台目录'
         required: true
-        default: 'https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz'
+        default: 'qualcommax/ipq60xx'  # 你的设备平台
 
 jobs:
   compile:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120  # 延长超时时间
+    timeout-minutes: 120  # 延长编译超时时间
 
     steps:
-      - name: 检查代码
+      - name: 检查rkp-ipid源码
         uses: actions/checkout@v4
         with:
           path: rkp-ipid
@@ -26,86 +26,112 @@ jobs:
 
       - name: 安装编译依赖
         run: |
-          sudo apt update -y
+          sudo apt update -y && sudo apt upgrade -y
           sudo apt install -y \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
-            gcc-aarch64-linux-gnu ninja-build cmake
-          # 清理缓存减少磁盘占用
-          sudo apt autoremove -y && sudo apt clean
+            gcc-aarch64-linux-gnu ninja-build cmake curl jq
+
+      - name: 动态获取最新SDK链接（解决404）
+        id: get_sdk_url
+        run: |
+          # 1. 拼接SDK平台目录URL（快照版通用目录）
+          SDK_BASE_URL="https://downloads.immortalwrt.org/snapshots/targets/${{ github.event.inputs.sdkTargetDir }}/"
+          
+          # 2. 获取目录页面，提取最新SDK压缩包链接（排除sha256sum文件）
+          SDK_URL=$(curl -sSL --insecure $SDK_BASE_URL | \
+            grep -oE 'href="immortalwrt-sdk-[^"]+\.tar\.xz"' | \
+            sed 's/href="//;s/"//' | \
+            head -n1)  # 取第一个（通常是最新的）SDK文件
+          
+          # 3. 拼接完整下载链接
+          FULL_SDK_URL="${SDK_BASE_URL}${SDK_URL}"
+          echo "获取到SDK链接：$FULL_SDK_URL"
+          echo "sdk_url=$FULL_SDK_URL" >> $GITHUB_OUTPUT
+
+          # 4. 验证链接有效性（提前检测，避免后续下载失败）
+          if ! curl -sSL --insecure --head $FULL_SDK_URL | grep -q "200 OK"; then
+            echo "错误：获取的SDK链接无效"
+            exit 1
+          fi
 
       - name: 下载并解压SDK
         run: |
           # 创建SDK目录
           mkdir -p sdk
-          # 下载SDK（带进度条和重试）
-          wget --no-check-certificate -c --progress=bar:force ${{ github.event.inputs.sdkUrl }} -O sdk.tar.xz
-          # 验证压缩包完整性
+          
+          # 下载SDK（带进度条，支持断点续传）
+          wget --no-check-certificate -c --progress=bar:force \
+            ${{ steps.get_sdk_url.outputs.sdk_url }} -O sdk.tar.xz
+          
+          # 解压SDK（排除冗余目录，直接到sdk文件夹）
           if ! tar xf sdk.tar.xz -C sdk --strip-components=1; then
-            echo "SDK压缩包损坏，尝试备用链接"
-            # 备用SDK链接（防止主链接失效）
-            wget --no-check-certificate -c https://archive.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-12.3.0_musl.Linux-x86_64.tar.xz -O sdk.tar.xz
+            echo "SDK压缩包损坏，重试下载"
+            # 重试逻辑
+            wget --no-check-certificate -c --progress=bar:force \
+              ${{ steps.get_sdk_url.outputs.sdk_url }} -O sdk.tar.xz
             tar xf sdk.tar.xz -C sdk --strip-components=1
           fi
 
-      - name: 准备编译环境
+      - name: 配置编译环境
         run: |
-          # 复制源码到SDK包目录
+          # 复制rkp-ipid源码到SDK的package目录
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
-          # 进入SDK目录
           cd sdk
-          
-          # 更新feeds
+          # 更新feeds（获取依赖）
           ./scripts/feeds update -a > /dev/null
           ./scripts/feeds install -a > /dev/null
           
-          # 加载目标平台配置
+          # 加载ipq60xx平台默认配置
           cp configs/immortalwrt_qualcommax_ipq60xx_defconfig .config
           
-          # 启用rkp-ipid模块
+          # 启用rkp-ipid模块编译
           echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
-          
-          # 锁定内核版本
+          # 锁定内核版本（与设备一致）
           echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
           
-          # 生成配置
+          # 生成最终编译配置
           make defconfig
 
-      - name: 编译模块
-        id: compile
+      - name: 编译rkp-ipid模块
+        id: compile_module
         run: |
           cd sdk
-          # 显示编译配置（用于调试）
-          cat .config | grep -E "KERNEL_PATCHVER|rkp-ipid"
+          # 显示关键配置（用于调试）
+          echo "=== 关键编译配置 ==="
+          cat .config | grep -E "KERNEL_PATCHVER|rkp-ipid|aarch64"
           
-          # 开始编译（限制线程数防止OOM）
-          make package/rkp-ipid/compile V=sc -j$(nproc --all)
+          # 编译（限制4线程，避免GitHub环境内存溢出）
+          make package/rkp-ipid/compile V=sc -j4
           
-          # 查找编译产物
+          # 查找编译产物（aarch64_cortex-a53架构的base目录）
           IPK_FILE=$(find bin/packages/aarch64_cortex-a53/base/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
           if [ -z "$IPK_FILE" ]; then
-            echo "编译产物未找到"
+            echo "错误：未找到编译后的ipk文件"
             exit 1
           fi
+          
+          echo "找到编译产物：$IPK_FILE"
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传编译产物
-        if: steps.compile.outcome == 'success'
+      - name: 上传编译产物（成功时）
+        if: steps.compile_module.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}
-          path: ${{ steps.compile.outputs.ipk_path }}
-          retention-days: 30
+          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}-ipq60xx
+          path: ${{ steps.compile_module.outputs.ipk_path }}
+          retention-days: 30  # 产物保留30天
 
       - name: 上传编译日志（失败时）
-        if: steps.compile.outcome == 'failure'
+        if: steps.compile_module.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: compile-logs
+          name: compile-errors-${{ github.run_id }}
           path: |
             sdk/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx/rkp-ipid-*/.compile.log
-            sdk/logs/
-          retention-days: 7
+            sdk/logs/build.log
+            sdk/.config
+          retention-days: 7  # 日志保留7天
