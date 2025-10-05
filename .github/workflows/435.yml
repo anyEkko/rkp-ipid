@@ -20,83 +20,126 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装依赖（含zstd）
+      - name: 安装依赖（强化zstd解压支持）
         run: |
           sudo apt update -y && sudo apt upgrade -y
           sudo apt install -y \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
-            gcc-aarch64-linux-gnu ninja-build cmake zstd
+            gcc-aarch64-linux-gnu ninja-build cmake zstd tar  # 确保tar版本支持zstd
 
-      - name: 下载新SDK（固定链接）
+      - name: 下载SDK（固定有效链接）
         run: |
+          # 你的新SDK链接
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
-          wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
-          [ -f "sdk.tar.zst" ] || { echo "SDK下载失败"; exit 1; }
-
-      - name: 解压SDK
-        run: |
-          mkdir -p sdk
-          tar --use-compress-program=zstd -xf sdk.tar.zst -C sdk --strip-components=1
-          [ -d "sdk/configs" ] || { echo "SDK解压失败，无configs目录"; exit 1; }
-
-      - name: 查看SDK实际配置文件（关键修复）
-        id: find_config
-        run: |
-          cd sdk/configs
-          # 列出所有ipq60xx相关的配置文件，方便找到正确名称
-          echo "=== SDK中可用的ipq60xx配置文件 ==="
-          ls -l *.defconfig | grep -i ipq60xx
           
-          # 自动匹配含"ipq60xx"的配置文件（取第一个，适配命名变化）
-          CONFIG_FILE=$(ls *.defconfig | grep -i ipq60xx | head -n1)
-          if [ -z "$CONFIG_FILE" ]; then
-            echo "错误：未找到ipq60xx相关配置文件"
+          # 下载并验证文件大小（避免空文件）
+          wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
+          if [ ! -f "sdk.tar.zst" ] || [ $(stat -c%s "sdk.tar.zst") -lt 1024000 ]; then
+            echo "SDK下载失败：文件不存在或过小"
+            exit 1
+          fi
+
+      - name: 查看SDK压缩包内部结构（关键修复）
+        id: check_sdk_structure
+        run: |
+          # 查看.tar.zst内的顶层目录名称（避免解压层级错误）
+          echo "=== SDK压缩包内部结构 ==="
+          tar --use-compress-program=zstd -tf sdk.tar.zst | head -n 10
+          
+          # 提取顶层目录名称（比如 "immortalwrt-sdk-qualcommax-ipq60xx-xxxx"）
+          TOP_DIR=$(tar --use-compress-program=zstd -tf sdk.tar.zst | head -n1 | cut -d'/' -f1)
+          if [ -z "$TOP_DIR" ]; then
+            echo "错误：无法识别压缩包顶层目录"
             exit 1
           fi
           
-          echo "找到正确配置文件：$CONFIG_FILE"
+          echo "压缩包顶层目录：$TOP_DIR"
+          echo "top_dir=$TOP_DIR" >> $GITHUB_OUTPUT
+
+      - name: 精准解压SDK（避免目录丢失）
+        run: |
+          # 删除旧目录（避免残留干扰）
+          rm -rf sdk
+          
+          # 先完整解压（保留顶层目录，确保所有子目录都在）
+          tar --use-compress-program=zstd -xf sdk.tar.zst
+          
+          # 重命名为"sdk"（简化后续操作）
+          mv ${{ steps.check_sdk_structure.outputs.top_dir }} sdk
+          
+          # 验证configs目录是否存在
+          if [ ! -d "sdk/configs" ]; then
+            echo "错误：解压后仍无configs目录，解压失败"
+            echo "当前sdk目录内容："
+            ls -l sdk/  # 打印目录内容，方便排查
+            exit 1
+          fi
+          echo "SDK解压成功，configs目录存在"
+
+      - name: 自动匹配ipq60xx配置文件
+        id: find_config
+        run: |
+          cd sdk/configs
+          echo "=== 可用配置文件 ==="
+          ls -l *.defconfig
+          
+          # 匹配含"ipq60xx"或"qualcommax"的配置文件（兼容不同命名）
+          CONFIG_FILE=$(ls *.defconfig | grep -iE "ipq60xx|qualcommax" | head -n1)
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "错误：未找到适配配置文件"
+            exit 1
+          fi
+          echo "使用配置文件：$CONFIG_FILE"
           echo "config_file=$CONFIG_FILE" >> $GITHUB_OUTPUT
 
-      - name: 配置编译环境（用实际配置文件）
+      - name: 配置编译环境
         run: |
-          # 复制rkp-ipid源码
+          # 复制rkp-ipid到SDK
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 用步骤5找到的实际配置文件（不再硬编码文件名）
+          # 加载匹配的配置文件
           cp configs/${{ steps.find_config.outputs.config_file }} .config
           
           # 启用模块+锁定内核版本
           echo "CONFIG_PACKAGE_kmod-rkp-ipid=y" >> .config
           echo "CONFIG_KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }}" >> .config
           
+          # 生成最终配置
           make defconfig
 
-      - name: 编译模块
+      - name: 编译rkp-ipid模块
         id: compile
         run: |
           cd sdk
+          # 限制线程数，避免内存溢出
           make package/rkp-ipid/compile V=sc -j4
           
+          # 查找aarch64架构的ipk产物
           IPK_FILE=$(find bin/packages/aarch64_cortex-a53/base/ -name "kmod-rkp-ipid_*.ipk" | head -n1)
-          [ -n "$IPK_FILE" ] || { echo "无ipk产物"; exit 1; }
+          if [ -z "$IPK_FILE" ]; then
+            echo "错误：未生成ipk文件"
+            exit 1
+          fi
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传产物
+      - name: 上传编译产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}
+          name: kmod-rkp-ipid-${{ github.event.inputs.kernelVersion }}-ipq60xx
           path: ${{ steps.compile.outputs.ipk_path }}
           retention-days: 30
 
-      - name: 上传错误日志
+      - name: 上传错误日志（编译失败时）
         if: steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
           name: compile-logs-${{ github.run_id }}
-          path: sdk/logs/
+          path: |
+            sdk/logs/
+            sdk/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq60xx/rkp-ipid-*/
           retention-days: 7
