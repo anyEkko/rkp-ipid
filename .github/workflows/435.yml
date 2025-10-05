@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     env:
-      # 直接使用系统安装的aarch64交叉编译器（核心）
       CROSS_COMPILE: aarch64-linux-gnu-
       ARCH: aarch64
 
@@ -24,24 +23,27 @@ jobs:
           path: rkp-ipid
           fetch-depth: 1
 
-      - name: 安装系统级aarch64交叉编译器（关键）
+      - name: 安装依赖（用apt-get消除脚本警告）
         run: |
-          sudo apt update -y && sudo apt upgrade -y
-          # 安装完整的aarch64交叉编译工具链（不依赖SDK工具链）
-          sudo apt install -y \
+          # 替换apt为apt-get（CLI更稳定，适合脚本），添加--yes自动确认
+          sudo apt-get update --quiet=2  # --quiet减少输出
+          sudo apt-get upgrade --yes --quiet=2
+          # 安装所有必需依赖，明确指定版本避免歧义
+          sudo apt-get install --yes --quiet=2 \
             build-essential libncurses5-dev libncursesw5-dev \
             zlib1g-dev gawk git gettext libssl-dev xsltproc wget \
             unzip python3 python3-distutils file flex bison \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            zstd linux-headers-${{ env.ARCH }}  # 安装aarch64内核头文件
-          # 验证编译器是否可用
+            gcc-aarch64-linux-gnu=4:11.2.0-1ubuntu1 g++-aarch64-linux-gnu=4:11.2.0-1ubuntu1 \
+            zstd linux-headers-${{ env.ARCH }}=5.4.0-153-generic
+          
+          # 验证交叉编译器（确保安装成功）
           if ! command -v ${{ env.CROSS_COMPILE }}gcc &> /dev/null; then
-            echo "错误：aarch64交叉编译器安装失败"
+            echo "错误：aarch64交叉编译器未安装成功"
             exit 1
           fi
-          echo "交叉编译器就绪：${{ env.CROSS_COMPILE }}gcc"
+          echo "交叉编译器版本：$(${{ env.CROSS_COMPILE }}gcc --version | head -n1)"
 
-      - name: 下载并解压通用SDK（仅用其内核头文件和Makefile）
+      - name: 下载并解压通用SDK
         run: |
           SDK_URL="https://downloads.immortalwrt.org/snapshots/targets/qualcommax/ipq60xx/immortalwrt-sdk-qualcommax-ipq60xx_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
           wget --no-check-certificate -c --progress=bar:force $SDK_URL -O sdk.tar.zst
@@ -51,16 +53,14 @@ jobs:
           tar --use-compress-program=zstd -xf sdk.tar.zst
           TOP_DIR=$(ls -d immortalwrt-sdk-*)
           mv "$TOP_DIR" sdk
-          echo "SDK解压完成，仅使用其内核配置文件"
 
-      - name: 简化配置（仅保留rkp-ipid编译必需参数）
+      - name: 配置编译参数（极简）
         run: |
-          # 复制rkp-ipid到SDK包目录
           mkdir -p sdk/package/rkp-ipid
           cp -r rkp-ipid/* sdk/package/rkp-ipid/
           
           cd sdk
-          # 仅配置编译rkp-ipid必需的参数（忽略其他依赖）
+          # 手动生成极简.config，仅保留必需参数
           cat > .config << EOF
           CONFIG_ARCH=${{ env.ARCH }}
           CONFIG_CROSS_COMPILE=${{ env.CROSS_COMPILE }}
@@ -70,35 +70,31 @@ jobs:
           CONFIG_KERNEL_BUILD_DIR=$(pwd)/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/
           EOF
           
-          # 生成基础配置（忽略无关依赖警告）
-          make defconfig IGNORE_ERRORS=1  # IGNORE_ERRORS忽略固件依赖警告
+          # 生成配置，忽略无关依赖警告
+          make defconfig IGNORE_ERRORS=1
 
-      - name: 编译rkp-ipid模块（直接用系统交叉编译器）
+      - name: 编译rkp-ipid模块
         id: compile
         run: |
           cd sdk
-          # 关键：直接编译模块，不依赖SDK工具链，忽略无关错误
+          # 用系统交叉编译器编译，忽略无关错误
           make package/rkp-ipid/compile \
             ARCH=${{ env.ARCH }} \
             CROSS_COMPILE=${{ env.CROSS_COMPILE }} \
             KERNEL_PATCHVER=${{ github.event.inputs.kernelVersion }} \
-            IGNORE_ERRORS=1 \  # 忽略固件依赖警告
+            IGNORE_ERRORS=1 \
             -j4 V=sc
           
-          # 搜索所有aarch64架构的ipk产物（通用SDK路径不固定）
-          echo "=== 搜索ipk产物 ==="
+          # 搜索产物
           IPK_FILE=$(find . -name "kmod-rkp-ipid_*.ipk" | grep -E "${{ env.ARCH }}|arm64" | head -n1)
-          
           if [ -z "$IPK_FILE" ]; then
-            echo "未找到产物，打印所有ipk文件："
+            echo "未找到产物，当前目录ipk："
             find . -name "*.ipk" | grep -E "${{ env.ARCH }}|arm64"
             exit 1
           fi
-          
-          echo "找到aarch64产物：$IPK_FILE"
           echo "ipk_path=$IPK_FILE" >> $GITHUB_OUTPUT
 
-      - name: 上传最终产物
+      - name: 上传产物
         if: steps.compile.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
@@ -110,9 +106,8 @@ jobs:
         if: steps.compile.outcome == 'failure'
         uses: actions/upload-artifact@v4
         with:
-          name: compile-logs-final
+          name: compile-logs
           path: |
             sdk/logs/
             sdk/build_dir/target-${{ env.ARCH }}_cortex-a53_musl/linux-*/rkp-ipid-*/
-            sdk/.config
           retention-days: 7
